@@ -132,7 +132,7 @@ pub async fn run_agent_loop(
         agent,
         session_id,
         session_manager,
-        ..
+        working_dir,
     } = handle;
 
     while let Some(prompt) = prompt_rx.recv().await {
@@ -172,7 +172,7 @@ pub async fn run_agent_loop(
             }
         }
 
-        let user_msg = build_user_message(&prompt).await;
+        let user_msg = build_user_message(&prompt, &working_dir).await;
         let session_config = SessionConfig {
             id: session_id.clone(),
             schedule_id: None,
@@ -412,37 +412,85 @@ const IMAGE_MIME: &[(&str, &str)] = &[
 ///   • image files (.png/.jpg/.jpeg/.gif/.webp) → `MessageContent::Image` (base64)
 ///   • all other files → `MessageContent::Text` with a fenced code block
 ///
+/// Relative paths are resolved against `working_dir` (the session's working
+/// directory) so that `@file` works correctly when the process is launched from
+/// a different directory than the original session.
+///
 /// Unresolvable `@path` tokens (file not found, unreadable) are left as-is in
 /// the text and a note is appended so the model understands the intent.
-pub async fn build_user_message(text: &str) -> Message {
+pub async fn build_user_message(text: &str, working_dir: &Path) -> Message {
     let mut message = Message::user();
-    // Preserve the original text (including newlines); remove/annotate @path tokens.
-    let mut remaining = text.to_string();
 
-    for word in text.split_whitespace() {
-        if let Some(raw_path) = word.strip_prefix('@') {
-            // Expand leading `~` to the home directory.
-            let expanded = if raw_path.starts_with("~/") || raw_path == "~" {
-                let home = dirs::home_dir().unwrap_or_default();
-                home.join(raw_path.trim_start_matches("~/"))
+    // Scan the text for @-prefixed tokens at word boundaries (preceded by the
+    // start of the string or ASCII whitespace).  We track byte positions so that
+    // replacements are precise and cannot accidentally match a substring inside
+    // another word (e.g. an email address like user@host.com).
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut tokens: Vec<(usize, usize)> = Vec::new(); // (start, end) byte ranges
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'@' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            let start = i;
+            let end = bytes[i..]
+                .iter()
+                .position(|b| b.is_ascii_whitespace())
+                .map(|j| i + j)
+                .unwrap_or(len);
+            if end > start + 1 {
+                // Only treat as an @-token if there is at least one char after @.
+                tokens.push((start, end));
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Resolve and attach files in forward order so message blocks appear in
+    // the same order the user wrote the tokens.
+    let mut attach_results: Vec<(usize, usize, anyhow::Result<AttachResult>)> =
+        Vec::with_capacity(tokens.len());
+    for (start, end) in &tokens {
+        let raw_path = &text[start + 1..*end]; // strip leading @
+        let expanded = if raw_path.starts_with("~/") || raw_path == "~" {
+            let home = dirs::home_dir().unwrap_or_default();
+            home.join(raw_path.trim_start_matches("~/"))
+        } else {
+            let p = std::path::Path::new(raw_path);
+            if p.is_relative() {
+                working_dir.join(p)
             } else {
-                std::path::PathBuf::from(raw_path)
-            };
+                p.to_path_buf()
+            }
+        };
+        attach_results.push((*start, *end, attach_path(&expanded).await));
+    }
 
-            match attach_path(&expanded).await {
-                Ok(AttachResult::Image { data, mime }) => {
-                    remaining = remaining.replacen(word, "", 1);
-                    message = message.with_image(data, mime);
-                }
-                Ok(AttachResult::Text { label, content }) => {
-                    remaining = remaining.replacen(word, "", 1);
-                    message = message.with_text(format!("{label}\n```\n{content}\n```"));
-                }
-                Err(e) => {
-                    // Annotate the token in-place so the model understands the intent.
-                    let annotated = format!("{word} (could not attach: {e})");
-                    remaining = remaining.replacen(word, &annotated, 1);
-                }
+    for (_, _, ref result) in &attach_results {
+        match result {
+            Ok(AttachResult::Image { data, mime }) => {
+                message = message.with_image(data.clone(), mime.clone());
+            }
+            Ok(AttachResult::Text { label, content }) => {
+                message = message.with_text(format!("{label}\n```\n{content}\n```"));
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Reconstruct the remaining prompt text, removing successful attachment tokens
+    // and annotating failed ones.  Apply replacements in *reverse* order so that
+    // earlier byte offsets stay valid.
+    let mut remaining = text.to_string();
+    for (start, end, result) in attach_results.into_iter().rev() {
+        match result {
+            Ok(_) => {
+                remaining.replace_range(start..end, "");
+            }
+            Err(e) => {
+                let annotation = format!("{} (could not attach: {e})", &text[start..end]);
+                remaining.replace_range(start..end, &annotation);
             }
         }
     }

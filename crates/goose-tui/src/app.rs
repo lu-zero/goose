@@ -225,6 +225,9 @@ pub fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
             Err(e) => {
                 loading.set(false);
                 status.set(format!("failed: {e}"));
+                // Clear the prompt sender so subsequent Enter presses cannot
+                // submit prompts to a non-existent agent worker.
+                prompt_tx.set(None);
                 // In non-interactive (--text) mode there is no input bar, so the
                 // process would hang forever without an explicit exit signal.
                 if initial_prompt.is_some() {
@@ -283,6 +286,26 @@ pub fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         &mut status,
                         &mut banner_visible,
                     );
+                } else {
+                    // Drain any prompts the user submitted during startup loading.
+                    // No Finished event fires during init, so we kick off the first
+                    // queued prompt directly once the agent worker is ready.
+                    let next = queue.read().clone().pop_front();
+                    if let Some(text) = next {
+                        let mut q = queue.read().clone();
+                        q.pop_front();
+                        queue.set(q);
+                        send_prompt_to_agent(
+                            text,
+                            &prompt_tx,
+                            &cancel_tx,
+                            cancel_token,
+                            &mut turns,
+                            &mut loading,
+                            &mut status,
+                            &mut banner_visible,
+                        );
+                    }
                 }
             }
         }
@@ -903,6 +926,7 @@ pub fn App(props: &AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                             active: !is_history && loading.get(),
                             status: status.to_string(),
                             width: term_width - 4,
+                            height: term_height,
                             scroll_offset: scroll_offset.get(),
                         )
                     }

@@ -13,6 +13,7 @@ use futures::StreamExt;
 use goose::action_required_manager::ActionRequiredManager;
 use goose::agents::{Agent, AgentEvent, SessionConfig};
 use goose::config::{get_all_extensions, Config};
+use goose::session::EnabledExtensionsState;
 use goose::conversation::message::{ActionRequiredData, Message, MessageContent};
 use goose::permission::permission_confirmation::{
     Permission, PermissionConfirmation, PrincipalType,
@@ -56,7 +57,11 @@ pub async fn build_agent(session_id_hint: Option<String>) -> Result<AgentHandle>
 
     // When resuming a session, prefer the provider/model stored in that session's
     // metadata over the current global config so behaviour stays consistent.
-    let (provider_name, model_config, session_id) = if let Some(ref id) = session_id_hint {
+    // Also restore the session's saved extension list instead of using the
+    // current global profile (mirrors CLI behaviour via EnabledExtensionsState).
+    let (provider_name, model_config, extensions, session_id) = if let Some(ref id) =
+        session_id_hint
+    {
         let session = session_manager.get_session(id, false).await?;
         let pname = session
             .provider_name
@@ -69,7 +74,9 @@ pub async fn build_agent(session_id_hint: Option<String>) -> Result<AgentHandle>
                 .unwrap_or_else(|_| goose::model::ModelConfig::new("gpt-4o").unwrap())
                 .with_canonical_limits(&pname)
         });
-        (pname, mcfg, session.id)
+        let exts =
+            EnabledExtensionsState::for_session(&session_manager, id, config).await;
+        (pname, mcfg, exts, session.id)
     } else {
         let provider_name = config.get_goose_provider()?;
         let model_name = config.get_goose_model()?;
@@ -84,7 +91,7 @@ pub async fn build_agent(session_id_hint: Option<String>) -> Result<AgentHandle>
                 agent.config.goose_mode,
             )
             .await?;
-        (provider_name, mcfg, session.id)
+        (provider_name, mcfg, extensions, session.id)
     };
 
     let provider = create(&provider_name, model_config, extensions.clone()).await?;
